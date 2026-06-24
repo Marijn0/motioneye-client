@@ -2,20 +2,17 @@
 """Client for motionEye."""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from pathlib import PurePath
 from types import TracebackType
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
-from . import utils
 from .const import (
     DEFAULT_ADMIN_USERNAME,
-    DEFAULT_SURVEILLANCE_USERNAME,
     DEFAULT_URL_SCHEME,
     KEY_ID,
     KEY_STREAMING_PORT,
@@ -73,14 +70,16 @@ class MotionEyeClient:
             self._session = session
             self._created_session = False
         else:
-            self._session = aiohttp.ClientSession()
+            # DummyCookieJar disables automatic cookie handling; we manage the
+            # session cookie explicitly so it works for any session, including
+            # those backed by a jar that rejects IP-address hosts (the default).
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar()
+            )
             self._created_session = True
+        self._session_cookie: str | None = None
         self._admin_username = admin_username or DEFAULT_ADMIN_USERNAME
         self._admin_password = admin_password or ""
-        self._surveillance_username = (
-            surveillance_username or DEFAULT_SURVEILLANCE_USERNAME
-        )
-        self._surveillance_password = surveillance_password or ""
 
     async def __aenter__(self) -> "MotionEyeClient" | None:
         """Enter context manager and connect the client."""
@@ -103,25 +102,12 @@ class MotionEyeClient:
         self,
         path: str,
         params: dict[str, Any] | None = None,
-        data: str | None = None,
-        method: str = "GET",
-        admin: bool = True,
     ) -> str:
         """Build a motionEye URL."""
-        username = self._admin_username if admin else self._surveillance_username
-        password = self._admin_password if admin else self._surveillance_password
-
         params = params or {}
-        params.update(
-            {
-                "_username": username,
-            }
-        )
-        url = urljoin(self._url, path + "?" + urlencode(params))
-        key = hashlib.sha1(password.encode("UTF-8")).hexdigest()
-        signature = utils.compute_signature(method, url, data, key)
-        url += f"&_signature={signature}"
-        return url
+        if params:
+            return urljoin(self._url, path + "?" + urlencode(params))
+        return urljoin(self._url, path)
 
     async def _async_request(
         self,
@@ -129,22 +115,20 @@ class MotionEyeClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         method: str = "GET",
-        admin: bool = True,
-    ) -> dict[str, Any] | None:
-        """Fetch return code and JSON from motionEye server."""
+        on_response: Callable[[aiohttp.ClientResponse], None] | None = None,
+        retry_auth: bool = True,
+        _raw: bool = False,
+    ) -> dict[str, Any] | bytes | None:
+        """Fetch return code and JSON, or raw bytes when requested, from motionEye."""
 
         serialized_json = json.dumps(data) if data is not None else None
-        url = self._build_url(
-            path,
-            params=params,
-            data=serialized_json,
-            method=method,
-            admin=admin,
-        )
+        url = self._build_url(path, params=params)
 
-        headers = {}
+        headers: dict[str, str] = {}
         if serialized_json:
-            headers = {"Content-Type": "application/json"}
+            headers["Content-Type"] = "application/json"
+        if self._session_cookie:
+            headers["Cookie"] = f"user={self._session_cookie}"
 
         if method == "GET":
             func = self._session.get
@@ -156,16 +140,38 @@ class MotionEyeClient:
         try:
             async with coro as response:
                 _LOGGER.debug("%s %s -> %i", method, url, response.status)
-                if response.status == 403:
+                if response.status in (401, 403):
+                    if retry_auth and path != "/login":
+                        _LOGGER.debug(
+                            "Authentication failed in request to %s; "
+                            "refreshing session",
+                            url,
+                        )
+                        await self.async_client_login()
+                        return await self._async_request(
+                            path,
+                            params=params,
+                            data=data,
+                            method=method,
+                            on_response=on_response,
+                            retry_auth=False,
+                            _raw=_raw,
+                        )
                     _LOGGER.warning(
                         f"Authentication failed in request to {url} : {response}"
                     )
                     raise MotionEyeClientInvalidAuthError(response)
                 elif not response.ok:
                     _LOGGER.warning(
-                        f"Unexpected HTTP response status code {response.status} for request: {url}"
+                        "Unexpected HTTP response status code %s for request: %s",
+                        response.status,
+                        url,
                     )
                     raise MotionEyeClientRequestError(response)
+                if on_response is not None:
+                    on_response(response)
+                if _raw:
+                    return await response.read()
                 try:
                     return_value: dict[str, Any] | None = await response.json(
                         content_type=None
@@ -183,7 +189,26 @@ class MotionEyeClient:
 
     async def async_client_login(self) -> dict[str, Any] | None:
         """Login to the motionEye server."""
-        return await self._async_request("/login")
+
+        self._session_cookie = None
+        return await self._async_request(
+            "/login",
+            data={"username": self._admin_username, "password": self._admin_password},
+            method="POST",
+            on_response=self._store_session_cookie,
+            retry_auth=False,
+        )
+
+    def _store_session_cookie(self, response: aiohttp.ClientResponse) -> None:
+        """Store the secure session cookie returned by motionEye."""
+        if morsel := response.cookies.get("user"):
+            self._session_cookie = morsel.value
+            return
+
+        _LOGGER.warning(
+            "Authentication failed: login response did not set a user cookie"
+        )
+        raise MotionEyeClientInvalidAuthError(response)
 
     async def async_client_close(self) -> bool:
         """Disconnect from the MotionEye server."""
@@ -258,16 +283,10 @@ class MotionEyeClient:
         return None
 
     def get_camera_snapshot_url(self, camera: dict[str, Any]) -> str | None:
-        """Get the camera stream URL."""
-        if not MotionEyeClient.is_camera_streaming(camera) or KEY_ID not in camera:
-            return None
-        return self._build_url(
-            urljoin(
-                self._url,
-                f"/picture/{camera[KEY_ID]}/current/",
-            ),
-            admin=False,
-        )
+        """Get the camera snapshot URL."""
+        if MotionEyeClient.is_camera_streaming(camera) and KEY_ID in camera:
+            return urljoin(self._url, f"/picture/{camera[KEY_ID]}/current/")
+        return None
 
     def _strip_leading_slash(self, path: str) -> str:
         """Strip leading slash from a path."""
@@ -281,23 +300,17 @@ class MotionEyeClient:
     def get_movie_url(self, camera_id: int, path: str, preview: bool = False) -> str:
         """Get the movie playback URL."""
         action = "preview" if preview else "playback"
-        return self._build_url(
-            urljoin(
-                self._url,
-                f"/movie/{camera_id}/{action}/{self._strip_leading_slash(path)}",
-            ),
-            admin=False,
+        return urljoin(
+            self._url,
+            f"/movie/{camera_id}/{action}/{self._strip_leading_slash(path)}",
         )
 
     def get_image_url(self, camera_id: int, path: str, preview: bool = False) -> str:
         """Get the image URL."""
         action = "preview" if preview else "download"
-        return self._build_url(
-            urljoin(
-                self._url,
-                f"/picture/{camera_id}/{action}/{self._strip_leading_slash(path)}",
-            ),
-            admin=False,
+        return urljoin(
+            self._url,
+            f"/picture/{camera_id}/{action}/{self._strip_leading_slash(path)}",
         )
 
     @classmethod
@@ -327,3 +340,10 @@ class MotionEyeClient:
         return await self._async_request(
             f"/picture/{camera_id}/list", params={"prefix": prefix} if prefix else None
         )
+
+    async def async_get_snapshot_image(self, camera_id: int) -> bytes | None:
+        """Fetch the current snapshot image using the authenticated session."""
+        result = await self._async_request(
+            f"/picture/{camera_id}/current/", _raw=True
+        )
+        return result if isinstance(result, bytes) else None

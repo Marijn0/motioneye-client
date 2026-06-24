@@ -30,9 +30,12 @@ The following arguments may be passed to the `MotionEyeClient` constructor:
 | surveillance_password | `str`                   | ""                          | The motionEye surveillance password |
 | session               | `aiohttp.ClientSession` | None                        | Optional aiohttp session to use     |
 
-This client needs both `admin` and `surveillance` passwords in order to interact with
-the API (which generally require the `admin` user), as well as prepare the URLs for
-data streaming (which require the `surveillance` user).
+Authentication uses a session cookie: `async_client_login` POSTs the `admin` credentials
+to `/login` and stores the returned cookie for subsequent requests. If a later request
+is rejected because the session expired, the client automatically logs in again with the
+stored admin credentials and retries that request once. The `surveillance_username` and
+`surveillance_password` arguments are accepted for API compatibility but are no longer
+used.
 
 ## Primary Client Methods
 
@@ -40,7 +43,9 @@ All async calls start with `async_`, and return the JSON response from the serve
 
 ### async_client_login
 
-Login to the motionEye server. Not actually necessary, but useful for verifying credentials.
+Login to the motionEye server. POSTs the admin credentials to `/login` and stores the
+session cookie returned by the server. This must succeed before any other API calls will
+be authorized.
 ### async_client_close
 
 Close the client session. Always returns True.
@@ -108,6 +113,11 @@ cannot be extracted from the motionEye server URL.
 Convenience method to take a camera dictionary (returned by `async_get_camera` or
 `async_get_cameras`) and return the string URL of a single still frame.
 
+### async_get_snapshot_image
+
+Fetch the current snapshot image for a camera as bytes using the authenticated client
+session.
+
 ### get_movie_url
 
 Convenience method to take a camera id and the path to a saved movie, and return a link
@@ -117,6 +127,13 @@ to playback the movie. Takes a `preview` argument that if `True` returns a URL t
 
 Convenience method to take a camera id and the path to a saved image, and return a link
 to that image. Takes a `preview` argument that if `True` returns a URL to a thumbnail.
+
+> **Note:** `get_movie_url` and `get_image_url` return bare URLs without authentication
+> credentials. Since motionEye 0.44.0 protects these endpoints with session-cookie
+> authentication, these URLs can only be fetched by a client that sends the stored
+> `user` session cookie. The API client sends that cookie for its own async requests,
+> but these bare URLs do not include it. Opening them directly in a browser or a
+> separate HTTP client will result in a 403.
 
 ### is_file_type_image / is_file_type_movie
 
